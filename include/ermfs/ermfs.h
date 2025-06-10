@@ -27,6 +27,9 @@ size_t ermfs_size(erm_file *file);
 /* Close and free the file. */
 void ermfs_close(erm_file *file);
 
+/* Destroy the file and free all memory. */
+void ermfs_destroy(erm_file *file);
+
 #ifdef __cplusplus
 }
 #endif
