@@ -22,6 +22,10 @@
 
 > **Early Incantation** — actively architecting. Codex is the team lead. Tuesday is judging silently. Jeremy is a UNIX wizard.
 
+## Build
+
+Run `make` to build the static library `libermfs.a`.
+
 ## License
 
 🧙‍♂️ Sorcerer's License, v1.0 — Use at your own peril. May summon tempfiles.
