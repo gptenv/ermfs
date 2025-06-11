@@ -18,7 +18,6 @@ struct erm_file {
     size_t capacity;
     int compressed;
     size_t original_size;
-    off_t position;
     int mode;
     char *path;
 #ifdef ERMFS_LOCKLESS
