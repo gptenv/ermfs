@@ -12,3 +12,7 @@ test_vfs
 test_edge_cases
 test_compression
 test_enhanced
+test_ermfd
+test_phase2_complete
+debug_compressed
+test_ermfd_compressed
