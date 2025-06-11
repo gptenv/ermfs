@@ -30,7 +30,6 @@ erm_file *ermfs_create(size_t initial_size) {
     file->capacity = initial_size;
     file->compressed = 0;
     file->original_size = 0;
-    file->position = 0;
     file->mode = O_RDWR;  /* Default mode */
     file->path = NULL;
 #ifdef ERMFS_LOCKLESS
@@ -204,8 +203,10 @@ static struct {
     erm_file *file;
 #ifdef ERMFS_LOCKLESS
     atomic_int in_use;
+    atomic_long position;  /* Per-FD position tracking */
 #else
     int in_use;
+    off_t position;        /* Per-FD position tracking */
 #endif
     int fd_mode;  /* Per-FD mode (can be more restrictive than file mode) */
 } fd_table[ERMFS_MAX_FILES];
@@ -241,8 +242,10 @@ static void init_fd_table(void) {
             fd_table[i].file = NULL;
 #ifdef ERMFS_LOCKLESS
             atomic_store(&fd_table[i].in_use, 0);
+            atomic_store(&fd_table[i].position, 0);
 #else
             fd_table[i].in_use = 0;
+            fd_table[i].position = 0;
 #endif
             fd_table[i].fd_mode = 0;
         }
@@ -283,31 +286,9 @@ erm_file *ermfs_find_file_by_path(const char *path) {
                 file_registry[i].path &&
                 strcmp(file_registry[i].path, path) == 0) {
                 erm_file *file = file_registry[i].file;
-                ermfs_lock_file(file);
+                /* In lockless mode, we don't need file locks for ref counting */
                 atomic_fetch_add(&file->ref_count, 1);
-                ermfs_unlock_file(file);
                 return file;
-            }
-        }
-        return NULL;
-    }
-#endif
-#ifdef ERMFS_LOCKLESS
-    if (ermfs_is_lockless()) {
-        for (int i = 0; i < ERMFS_MAX_REGISTRY_FILES; i++) {
-            if (atomic_load(&file_registry[i].in_use) &&
-                file_registry[i].path &&
-                strcmp(file_registry[i].path, path) == 0) {
-                erm_file *file = file_registry[i].file;
-                free(file_registry[i].path);
-                file_registry[i].file = NULL;
-                file_registry[i].path = NULL;
-                atomic_store(&file_registry[i].in_use, 0);
-
-                if (file) {
-                    ermfs_destroy(file);
-                }
-                break;
             }
         }
         return NULL;
@@ -401,6 +382,28 @@ static int register_file(erm_file *file, const char *path) {
 static void unregister_file(const char *path) {
     init_file_registry();
     
+#ifdef ERMFS_LOCKLESS
+    if (ermfs_is_lockless()) {
+        for (int i = 0; i < ERMFS_MAX_REGISTRY_FILES; i++) {
+            if (atomic_load(&file_registry[i].in_use) &&
+                file_registry[i].path &&
+                strcmp(file_registry[i].path, path) == 0) {
+                erm_file *file = file_registry[i].file;
+                free(file_registry[i].path);
+                file_registry[i].file = NULL;
+                file_registry[i].path = NULL;
+                atomic_store(&file_registry[i].in_use, 0);
+
+                if (file) {
+                    ermfs_destroy(file);
+                }
+                break;
+            }
+        }
+        return;
+    }
+#endif
+    
     pthread_mutex_lock(&file_registry_mutex);
     for (int i = 0; i < ERMFS_MAX_REGISTRY_FILES; i++) {
         if (file_registry[i].in_use && 
@@ -460,9 +463,10 @@ static ermfs_fd_t alloc_fd(erm_file *file, int fd_mode) {
     if (ermfs_is_lockless()) {
         for (int i = 0; i < ERMFS_MAX_FILES; i++) {
             int expected = 0;
-            if (atomic_compare_exchange_strong((atomic_int *)&fd_table[i].in_use, &expected, 1)) {
+            if (atomic_compare_exchange_strong(&fd_table[i].in_use, &expected, 1)) {
                 fd_table[i].file = file;
                 fd_table[i].fd_mode = fd_mode;
+                atomic_store(&fd_table[i].position, 0);  /* Initialize position */
                 return ERMFS_FD_OFFSET + i;
             }
         }
@@ -476,6 +480,7 @@ static ermfs_fd_t alloc_fd(erm_file *file, int fd_mode) {
             fd_table[i].file = file;
             fd_table[i].in_use = 1;
             fd_table[i].fd_mode = fd_mode;
+            fd_table[i].position = 0;  /* Initialize position */
             pthread_mutex_unlock(&fd_table_mutex);
             return ERMFS_FD_OFFSET + i;
         }
@@ -497,7 +502,7 @@ static erm_file *get_file_from_fd(ermfs_fd_t fd) {
     
 #ifdef ERMFS_LOCKLESS
     if (ermfs_is_lockless()) {
-        if (!fd_table[idx].in_use) {
+        if (!atomic_load(&fd_table[idx].in_use)) {
             errno = EBADF;
             return NULL;
         }
@@ -526,7 +531,7 @@ static int get_fd_mode(ermfs_fd_t fd) {
     
 #ifdef ERMFS_LOCKLESS
     if (ermfs_is_lockless()) {
-        if (!fd_table[idx].in_use)
+        if (!atomic_load(&fd_table[idx].in_use))
             return -1;
         return fd_table[idx].fd_mode;
     }
@@ -541,6 +546,86 @@ static int get_fd_mode(ermfs_fd_t fd) {
     return mode;
 }
 
+/* Get FD position */
+static off_t get_fd_position(ermfs_fd_t fd) {
+    init_fd_table();
+    
+    int idx = fd - ERMFS_FD_OFFSET;
+    if (idx < 0 || idx >= ERMFS_MAX_FILES) {
+        return -1;
+    }
+    
+#ifdef ERMFS_LOCKLESS
+    if (ermfs_is_lockless()) {
+        if (!atomic_load(&fd_table[idx].in_use))
+            return -1;
+        return atomic_load(&fd_table[idx].position);
+    }
+#endif
+    pthread_mutex_lock(&fd_table_mutex);
+    if (!fd_table[idx].in_use) {
+        pthread_mutex_unlock(&fd_table_mutex);
+        return -1;
+    }
+    off_t pos = fd_table[idx].position;
+    pthread_mutex_unlock(&fd_table_mutex);
+    return pos;
+}
+
+/* Set FD position */
+static int set_fd_position(ermfs_fd_t fd, off_t position) {
+    init_fd_table();
+    
+    int idx = fd - ERMFS_FD_OFFSET;
+    if (idx < 0 || idx >= ERMFS_MAX_FILES) {
+        return -1;
+    }
+    
+#ifdef ERMFS_LOCKLESS
+    if (ermfs_is_lockless()) {
+        if (!atomic_load(&fd_table[idx].in_use))
+            return -1;
+        atomic_store(&fd_table[idx].position, position);
+        return 0;
+    }
+#endif
+    pthread_mutex_lock(&fd_table_mutex);
+    if (!fd_table[idx].in_use) {
+        pthread_mutex_unlock(&fd_table_mutex);
+        return -1;
+    }
+    fd_table[idx].position = position;
+    pthread_mutex_unlock(&fd_table_mutex);
+    return 0;
+}
+
+/* Atomically add to FD position and return new position */
+static off_t add_fd_position(ermfs_fd_t fd, off_t delta) {
+    init_fd_table();
+    
+    int idx = fd - ERMFS_FD_OFFSET;
+    if (idx < 0 || idx >= ERMFS_MAX_FILES) {
+        return -1;
+    }
+    
+#ifdef ERMFS_LOCKLESS
+    if (ermfs_is_lockless()) {
+        if (!atomic_load(&fd_table[idx].in_use))
+            return -1;
+        return atomic_fetch_add(&fd_table[idx].position, delta) + delta;
+    }
+#endif
+    pthread_mutex_lock(&fd_table_mutex);
+    if (!fd_table[idx].in_use) {
+        pthread_mutex_unlock(&fd_table_mutex);
+        return -1;
+    }
+    fd_table[idx].position += delta;
+    off_t new_pos = fd_table[idx].position;
+    pthread_mutex_unlock(&fd_table_mutex);
+    return new_pos;
+}
+
 /* Free a file descriptor */
 static int free_fd(ermfs_fd_t fd) {
     init_fd_table();
@@ -553,13 +638,14 @@ static int free_fd(ermfs_fd_t fd) {
     
 #ifdef ERMFS_LOCKLESS
     if (ermfs_is_lockless()) {
-        if (!fd_table[idx].in_use) {
+        if (!atomic_load(&fd_table[idx].in_use)) {
             errno = EBADF;
             return -1;
         }
         fd_table[idx].file = NULL;
-        atomic_store((atomic_int *)&fd_table[idx].in_use, 0);
+        atomic_store(&fd_table[idx].in_use, 0);
         fd_table[idx].fd_mode = 0;
+        atomic_store(&fd_table[idx].position, 0);
         return 0;
     }
 #endif
@@ -572,6 +658,7 @@ static int free_fd(ermfs_fd_t fd) {
     fd_table[idx].file = NULL;
     fd_table[idx].in_use = 0;
     fd_table[idx].fd_mode = 0;
+    fd_table[idx].position = 0;
     pthread_mutex_unlock(&fd_table_mutex);
     return 0;
 }
@@ -676,19 +763,29 @@ ssize_t ermfs_read(ermfs_fd_t fd, void *buf, size_t len) {
         return -1;
     }
     
+    /* Get current FD position */
+    off_t position = get_fd_position(fd);
+    if (position < 0) {
+        ermfs_unlock_file(file);
+        errno = EBADF;
+        return -1;
+    }
+    
     /* Check bounds */
-    if (file->position >= (off_t)file->size) {
+    if (position >= (off_t)file->size) {
         ermfs_unlock_file(file);
         return 0;  /* EOF */
     }
     
     /* Calculate how much we can actually read */
-    size_t available = file->size - file->position;
+    size_t available = file->size - position;
     size_t to_read = (len < available) ? len : available;
     
     /* Copy data to buffer */
-    memcpy(buf, (char *)file->data + file->position, to_read);
-    file->position += to_read;
+    memcpy(buf, (char *)file->data + position, to_read);
+    
+    /* Update FD position */
+    add_fd_position(fd, to_read);
     
     ermfs_unlock_file(file);
     return (ssize_t)to_read;
@@ -721,8 +818,16 @@ ssize_t ermfs_write_fd(ermfs_fd_t fd, const void *buf, size_t len) {
         return -1;
     }
     
+    /* Get current FD position */
+    off_t position = get_fd_position(fd);
+    if (position < 0) {
+        ermfs_unlock_file(file);
+        errno = EBADF;
+        return -1;
+    }
+    
     /* Calculate required size at current position */
-    size_t required_end = file->position + len;
+    size_t required_end = position + len;
     
     /* Expand file if necessary */
     if (required_end > file->capacity) {
@@ -741,12 +846,14 @@ ssize_t ermfs_write_fd(ermfs_fd_t fd, const void *buf, size_t len) {
     }
     
     /* Write data at current position */
-    memcpy((char *)file->data + file->position, buf, len);
-    file->position += len;
+    memcpy((char *)file->data + position, buf, len);
+    
+    /* Update FD position */
+    off_t new_position = add_fd_position(fd, len);
     
     /* Update file size if we wrote past the current end */
-    if (file->position > (off_t)file->size) {
-        file->size = file->position;
+    if (new_position > (off_t)file->size) {
+        file->size = new_position;
     }
     
     ermfs_unlock_file(file);
@@ -756,6 +863,13 @@ ssize_t ermfs_write_fd(ermfs_fd_t fd, const void *buf, size_t len) {
 off_t ermfs_seek(ermfs_fd_t fd, off_t offset, int whence) {
     erm_file *file = get_file_from_fd(fd);
     if (!file) {
+        errno = EBADF;
+        return -1;
+    }
+    
+    /* Get current FD position for SEEK_CUR */
+    off_t current_pos = get_fd_position(fd);
+    if (current_pos < 0) {
         errno = EBADF;
         return -1;
     }
@@ -775,7 +889,7 @@ off_t ermfs_seek(ermfs_fd_t fd, off_t offset, int whence) {
             new_pos = offset;
             break;
         case SEEK_CUR:
-            new_pos = file->position + offset;
+            new_pos = current_pos + offset;
             break;
         case SEEK_END:
             new_pos = (off_t)file->size + offset;
@@ -793,10 +907,15 @@ off_t ermfs_seek(ermfs_fd_t fd, off_t offset, int whence) {
         return -1;
     }
     
-    file->position = new_pos;
-    off_t result = new_pos;
+    /* Set the new FD position */
+    if (set_fd_position(fd, new_pos) != 0) {
+        ermfs_unlock_file(file);
+        errno = EBADF;
+        return -1;
+    }
+    
     ermfs_unlock_file(file);
-    return result;
+    return new_pos;
 }
 
 int ermfs_stat(ermfs_fd_t fd, struct ermfs_stat *stat) {
@@ -914,11 +1033,6 @@ int ermfs_truncate(ermfs_fd_t fd, off_t length) {
     }
     
     file->size = new_size;
-    
-    /* Adjust position if it's beyond the new end */
-    if (file->position > (off_t)new_size) {
-        file->position = (off_t)new_size;
-    }
     
     ermfs_unlock_file(file);
     return 0;
