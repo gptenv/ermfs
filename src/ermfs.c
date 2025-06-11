@@ -216,7 +216,7 @@ static pthread_mutex_t fd_table_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* === File Registry for Path-Based Lookup === */
 
-#define ERMFS_MAX_REGISTRY_FILES 256
+#define ERMFS_MAX_REGISTRY_FILES 1024
 
 static struct {
     erm_file *file;
@@ -388,15 +388,10 @@ static void unregister_file(const char *path) {
             if (atomic_load(&file_registry[i].in_use) &&
                 file_registry[i].path &&
                 strcmp(file_registry[i].path, path) == 0) {
-                erm_file *file = file_registry[i].file;
                 free(file_registry[i].path);
                 file_registry[i].file = NULL;
                 file_registry[i].path = NULL;
                 atomic_store(&file_registry[i].in_use, 0);
-
-                if (file) {
-                    ermfs_destroy(file);
-                }
                 break;
             }
         }
@@ -410,8 +405,6 @@ static void unregister_file(const char *path) {
             file_registry[i].path && 
             strcmp(file_registry[i].path, path) == 0) {
             
-            erm_file *file = file_registry[i].file;
-            
             free(file_registry[i].path);
             file_registry[i].file = NULL;
             file_registry[i].path = NULL;
@@ -420,11 +413,6 @@ static void unregister_file(const char *path) {
 #else
             file_registry[i].in_use = 0;
 #endif
-            
-            /* Registry releases its reference to the file */
-            if (file) {
-                ermfs_destroy(file);
-            }
             
             break;
         }
@@ -955,20 +943,21 @@ int ermfs_close_fd(ermfs_fd_t fd) {
     /* Compress the file using existing close logic */
     ermfs_close(file);
     
-    /* Check if this is the last reference and if file is compressed */
+    /* Check if this will be the last reference after we release our FD reference.
+     * The ref_count should be 2: one for the registry, one for our FD. */
     ermfs_lock_file(file);
-    int is_last_ref = (file->ref_count <= 1);
+    int is_last_ref = (file->ref_count <= 2);
     int is_compressed = file->compressed;
     ermfs_unlock_file(file);
     
-    /* Destroy the file (will decrement ref_count) */
-    ermfs_destroy(file);
-    
-    /* If last reference and file is not compressed, unregister from registry
-     * Compressed files remain in registry for future export */
+    /* If this is the last FD reference, and file is not compressed, unregister from registry.
+     * Compressed files are kept for potential export (Phase 2 compatibility). */
     if (is_last_ref && path && !is_compressed) {
         unregister_file(path);
     }
+    
+    /* Destroy the file (will decrement ref_count) */
+    ermfs_destroy(file);
     
     /* Free the file descriptor slot */
     int result = free_fd(fd);
