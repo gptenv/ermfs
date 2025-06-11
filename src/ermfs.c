@@ -1,6 +1,7 @@
 #include "ermfs/ermfs.h"
 #include "ermfs/erm_alloc.h"
 #include "ermfs/erm_compress.h"
+#include "ermfs/erm_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -9,18 +10,6 @@
 #include <errno.h>
 #include <pthread.h>
 
-struct erm_file {
-    void *data;
-    size_t size;
-    size_t capacity;
-    int compressed;        /* 1 if data is compressed, 0 otherwise */
-    size_t original_size;  /* original size before compression */
-    off_t position;        /* current seek position */
-    int mode;              /* file access mode (O_RDONLY, O_WRONLY, O_RDWR) */
-    char *path;            /* file path (owned by this struct) */
-    int ref_count;         /* reference count for shared files */
-    pthread_mutex_t mutex; /* mutex for thread safety */
-};
 
 erm_file *ermfs_create(size_t initial_size) {
     erm_file *file = malloc(sizeof(*file));
@@ -256,8 +245,8 @@ static void init_file_registry(void) {
     pthread_mutex_unlock(&file_registry_mutex);
 }
 
-/* Find file by path in registry */
-static erm_file *find_file_by_path(const char *path) {
+/* Find file by path in registry (increments ref_count on success) */
+erm_file *ermfs_find_file_by_path(const char *path) {
     init_file_registry();
     
     pthread_mutex_lock(&file_registry_mutex);
@@ -319,6 +308,19 @@ static void unregister_file(const char *path) {
         }
     }
     pthread_mutex_unlock(&file_registry_mutex);
+}
+
+/* Lock and unlock helpers for internal modules */
+void ermfs_lock_file(erm_file *file) {
+    if (file) {
+        pthread_mutex_lock(&file->mutex);
+    }
+}
+
+void ermfs_unlock_file(erm_file *file) {
+    if (file) {
+        pthread_mutex_unlock(&file->mutex);
+    }
 }
 
 /* Allocate a new file descriptor */
@@ -412,7 +414,7 @@ ermfs_fd_t ermfs_open(const char *path, int flags) {
     }
     
     /* Try to find existing file first */
-    erm_file *file = find_file_by_path(path);
+    erm_file *file = ermfs_find_file_by_path(path);
     
     if (!file) {
         /* Create a new file */
