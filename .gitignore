@@ -11,3 +11,4 @@ libermfs.a
 test_vfs
 test_edge_cases
 test_compression
+test_enhanced

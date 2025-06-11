@@ -43,6 +43,9 @@ int ermfs_stat(ermfs_fd_t fd, struct ermfs_stat *stat);
 /* Close file descriptor, returns 0 on success or -1 on error */
 int ermfs_close_fd(ermfs_fd_t fd);
 
+/* Truncate file to specified size, returns 0 on success or -1 on error */
+int ermfs_truncate(ermfs_fd_t fd, off_t length);
+
 /* === Legacy Direct File API === */
 
 /* Create a new in-memory file with specified initial capacity. */
