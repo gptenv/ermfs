@@ -282,6 +282,12 @@ static int register_file(erm_file *file, const char *path) {
             }
             strcpy(file_registry[i].path, path);
             file_registry[i].in_use = 1;
+            
+            /* Registry holds a reference to the file */
+            pthread_mutex_lock(&file->mutex);
+            file->ref_count++;
+            pthread_mutex_unlock(&file->mutex);
+            
             pthread_mutex_unlock(&file_registry_mutex);
             return 0;
         }
@@ -300,10 +306,19 @@ static void unregister_file(const char *path) {
         if (file_registry[i].in_use && 
             file_registry[i].path && 
             strcmp(file_registry[i].path, path) == 0) {
+            
+            erm_file *file = file_registry[i].file;
+            
             free(file_registry[i].path);
             file_registry[i].file = NULL;
             file_registry[i].path = NULL;
             file_registry[i].in_use = 0;
+            
+            /* Registry releases its reference to the file */
+            if (file) {
+                ermfs_destroy(file);
+            }
+            
             break;
         }
     }
@@ -665,18 +680,20 @@ int ermfs_close_fd(ermfs_fd_t fd) {
     /* Compress the file using existing close logic */
     ermfs_close(file);
     
-    /* Check if this is the last reference */
+    /* Check if this is the last reference and if file is compressed */
     pthread_mutex_lock(&file->mutex);
     int is_last_ref = (file->ref_count <= 1);
+    int is_compressed = file->compressed;
     pthread_mutex_unlock(&file->mutex);
-    
-    /* If last reference, unregister from registry */
-    if (is_last_ref && path) {
-        unregister_file(path);
-    }
     
     /* Destroy the file (will decrement ref_count) */
     ermfs_destroy(file);
+    
+    /* If last reference and file is not compressed, unregister from registry
+     * Compressed files remain in registry for future export */
+    if (is_last_ref && path && !is_compressed) {
+        unregister_file(path);
+    }
     
     /* Free the file descriptor slot */
     int result = free_fd(fd);
