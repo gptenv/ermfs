@@ -213,3 +213,187 @@ This keeps ERMFS blazing fast, true to spec, future-proof for mount shims, and f
 
 ---
 
+Phase 2 appears to be complete and implemented, so moving on now to the below... Please implement Phase 3 as specified by what Tuesday says below right here:
+
+---
+
+Tuesday says:
+
+**Perfect.**
+Strap in. This is where ERMFS becomes something truly unholy.
+
+---
+
+# 📄 **ERMFS PHASE 3 DESIGN SPEC — "Zero-Lock Daemon Edition"**
+
+---
+
+## 🔥 **Mission Objective**
+
+Implement an **optional lockless mode** for ERMFS that:
+
+* Eliminates all pthread mutexes.
+* Preserves thread safety.
+* Maximizes multi-core scaling.
+* Reduces tail latency under concurrency.
+* Uses **atomic operations**, circular buffers, and modern lockless systems design.
+
+---
+
+## 🧠 **Why We're Doing This**
+
+* Modern CPUs suffer from lock contention due to cacheline bouncing.
+* Atomics + lockless structures can:
+
+  * Operate entirely in L1/L2 cache.
+  * Avoid kernel futex/syscalls.
+  * Enable higher throughput with lower variance.
+* ERMFS is fully RAM-backed — perfect target for lockless design.
+* Our problem domain allows for:
+
+  * Predictable file handle allocation.
+  * Fixed-lifetime objects.
+  * No blocking IO or disk latencies.
+
+---
+
+## 🏗️ **System Design**
+
+### 🔧 Dual Mode Support
+
+* **Compile-time flag:** `ERMFS_LOCKLESS`
+* **Runtime override option:** `ermfs_set_lockless_mode(bool enable)`
+* Code supports both lock-based and lockless modes side-by-side.
+
+---
+
+### 🧩 Targeted Lockless Subsystems
+
+| Subsystem               | Lockless Replacement              | Notes                                                |
+| ----------------------- | --------------------------------- | ---------------------------------------------------- |
+| **FD Table**            | Atomic slot reservation           | Global file descriptor pool                          |
+| **Registry (Path Map)** | Lockless hashmap                  | Use open addressing or SwissTable-style hash         |
+| **File Refcounts**      | Atomic refcounts                  | Simple `atomic_fetch_add()` and `atomic_fetch_sub()` |
+| **Open/Close Logic**    | CAS on table slots                | Safe open/close under concurrency                    |
+| **Write Pointers**      | Per-file atomic position tracking | No file-level locks on offset updates                |
+
+---
+
+## 🔧 **Key Algorithms**
+
+### FD Table
+
+* Fixed-size pre-allocated array of file descriptor slots.
+* Each slot:
+
+```c
+struct ermfs_fd_entry {
+    atomic_int fd_in_use; // 0 = free, 1 = allocated
+    struct erm_file *file;
+};
+```
+
+* Allocation:
+
+  * Linear scan + atomic CAS to claim slot.
+* Deallocation:
+
+  * Atomic clear of fd\_in\_use.
+
+---
+
+### Path Registry
+
+* Lockless hashmap:
+
+  * Use open-addressed probing or SwissTable-style.
+  * Backed by atomic compare-and-swap insert/remove.
+
+* Registry operations:
+
+  * Lookup by path key atomically.
+  * Insert new paths only if empty slot is found.
+  * Removal uses atomic tombstones for safe reclamation.
+
+---
+
+### Reference Counting
+
+* Refcounts done via atomic increment/decrement:
+
+```c
+atomic_fetch_add(&file->refcount, 1);
+atomic_fetch_sub(&file->refcount, 1);
+```
+
+* Memory freeing only when `refcount == 0` after atomic decrement.
+
+---
+
+### Write/Read Seek Offsets
+
+* Use atomic position tracking for concurrent writes (if permitted).
+* Reader/writer offsets can be handled independently per FD.
+
+---
+
+### Global Config Struct (Optional)
+
+```c
+struct ermfs_config {
+    bool lockless_enabled;
+};
+```
+
+---
+
+## 🚩 **Constraints**
+
+* Lockless mode applies to internal VFS structures.
+* Compression (zlib/gzip) may remain single-threaded for now.
+* External filesystem semantics (e.g. memfd behavior) remain unchanged.
+* No performance degradation in lock-based mode.
+
+---
+
+## 🧪 **Test Coverage Required**
+
+| Test Type           | Coverage                                          |
+| ------------------- | ------------------------------------------------- |
+| Correctness         | All existing tests run in lockless mode           |
+| Race Conditions     | High-concurrency open/close/read/write            |
+| Memory Safety       | Leak testing under thousands of open/close cycles |
+| Refcount Validation | Stress test refcount transitions                  |
+| Error Handling      | Registry collision handling                       |
+| Benchmark Suite     | Compare lockless vs locking throughput            |
+
+---
+
+## 🛠️ **Codex & Copilot Task List**
+
+### 1️⃣ New Files:
+
+* `ermfs_lockless.h`
+* `ermfs_lockless.c`
+
+### 2️⃣ Modifications:
+
+* `ermfs_fd_table.c` — swapable backend for locking vs lockless
+* `ermfs_registry.c` — add lockless map mode
+
+### 3️⃣ Tests:
+
+* `test_lockless_concurrency.c`
+* `test_lockless_correctness.c`
+* `benchmark_lockless.c`
+
+---
+
+# 🧙‍♀️ **Architect’s Final Notes**
+
+* This will transform ERMFS into one of the fastest possible RAM-native file systems.
+* This architecture can scale efficiently across 32, 64, even 128-core systems.
+* You will become the owner of one of the only experimental zero-copy, zero-lock POSIX-compatible RAM filesystems in existence.
+
+---
+
