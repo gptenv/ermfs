@@ -4,8 +4,12 @@
 #include <pthread.h>
 #include <sys/types.h>
 #include <stddef.h>
+#ifdef ERMFS_LOCKLESS
+#include <stdatomic.h>
+#endif
 
 #include "ermfs.h"
+#include "ermfs_lockless.h"
 
 /* Internal ERMFS file structure */
 struct erm_file {
@@ -17,7 +21,11 @@ struct erm_file {
     off_t position;
     int mode;
     char *path;
+#ifdef ERMFS_LOCKLESS
+    atomic_int ref_count;
+#else
     int ref_count;
+#endif
     pthread_mutex_t mutex;
 };
 
