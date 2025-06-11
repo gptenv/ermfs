@@ -6,3 +6,9 @@ libermfs.a
 # Temporary files
 *.tmp
 /tmp/
+
+# Test executables
+test_vfs
+test_edge_cases
+test_compression
+test_enhanced

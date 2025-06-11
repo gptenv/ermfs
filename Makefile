@@ -1,6 +1,6 @@
 CC?=gcc
 CFLAGS?=-Wall -Wextra -O2 -g -Iinclude
-LDFLAGS?=-lz
+LDFLAGS?=-lz -lpthread
 
 SRCS=src/erm_alloc.c src/ermfs.c src/erm_compress.c
 OBJS=$(SRCS:.c=.o)
