@@ -9,6 +9,9 @@
 #include <unistd.h>
 #include <errno.h>
 #include <pthread.h>
+#ifdef ERMFS_LOCKLESS
+#include <stdatomic.h>
+#endif
 
 
 erm_file *ermfs_create(size_t initial_size) {
@@ -30,7 +33,11 @@ erm_file *ermfs_create(size_t initial_size) {
     file->position = 0;
     file->mode = O_RDWR;  /* Default mode */
     file->path = NULL;
+#ifdef ERMFS_LOCKLESS
+    atomic_init(&file->ref_count, 1);
+#else
     file->ref_count = 1;
+#endif
     
     /* Initialize mutex */
     if (pthread_mutex_init(&file->mutex, NULL) != 0) {
@@ -170,17 +177,21 @@ void ermfs_destroy(erm_file *file) {
         return;
     }
     
-    pthread_mutex_lock(&file->mutex);
+    ermfs_lock_file(file);
+#ifdef ERMFS_LOCKLESS
+    atomic_fetch_sub(&file->ref_count, 1);
+#else
     file->ref_count--;
+#endif
     
     if (file->ref_count <= 0) {
         erm_free(file->data, file->capacity);
         free(file->path);  /* Free the path string if allocated */
-        pthread_mutex_unlock(&file->mutex);
+        ermfs_unlock_file(file);
         pthread_mutex_destroy(&file->mutex);
         free(file);
     } else {
-        pthread_mutex_unlock(&file->mutex);
+        ermfs_unlock_file(file);
     }
 }
 
@@ -191,7 +202,11 @@ void ermfs_destroy(erm_file *file) {
 
 static struct {
     erm_file *file;
+#ifdef ERMFS_LOCKLESS
+    atomic_int in_use;
+#else
     int in_use;
+#endif
     int fd_mode;  /* Per-FD mode (can be more restrictive than file mode) */
 } fd_table[ERMFS_MAX_FILES];
 
@@ -205,7 +220,11 @@ static pthread_mutex_t fd_table_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct {
     erm_file *file;
     char *path;
+#ifdef ERMFS_LOCKLESS
+    atomic_int in_use;
+#else
     int in_use;
+#endif
 } file_registry[ERMFS_MAX_REGISTRY_FILES];
 
 static int file_registry_initialized = 0;
@@ -220,7 +239,11 @@ static void init_fd_table(void) {
     if (!fd_table_initialized) {
         for (int i = 0; i < ERMFS_MAX_FILES; i++) {
             fd_table[i].file = NULL;
+#ifdef ERMFS_LOCKLESS
+            atomic_store(&fd_table[i].in_use, 0);
+#else
             fd_table[i].in_use = 0;
+#endif
             fd_table[i].fd_mode = 0;
         }
         fd_table_initialized = 1;
@@ -238,7 +261,11 @@ static void init_file_registry(void) {
         for (int i = 0; i < ERMFS_MAX_REGISTRY_FILES; i++) {
             file_registry[i].file = NULL;
             file_registry[i].path = NULL;
+#ifdef ERMFS_LOCKLESS
+            atomic_store(&file_registry[i].in_use, 0);
+#else
             file_registry[i].in_use = 0;
+#endif
         }
         file_registry_initialized = 1;
     }
@@ -249,15 +276,56 @@ static void init_file_registry(void) {
 erm_file *ermfs_find_file_by_path(const char *path) {
     init_file_registry();
     
+#ifdef ERMFS_LOCKLESS
+    if (ermfs_is_lockless()) {
+        for (int i = 0; i < ERMFS_MAX_REGISTRY_FILES; i++) {
+            if (atomic_load(&file_registry[i].in_use) &&
+                file_registry[i].path &&
+                strcmp(file_registry[i].path, path) == 0) {
+                erm_file *file = file_registry[i].file;
+                ermfs_lock_file(file);
+                atomic_fetch_add(&file->ref_count, 1);
+                ermfs_unlock_file(file);
+                return file;
+            }
+        }
+        return NULL;
+    }
+#endif
+#ifdef ERMFS_LOCKLESS
+    if (ermfs_is_lockless()) {
+        for (int i = 0; i < ERMFS_MAX_REGISTRY_FILES; i++) {
+            if (atomic_load(&file_registry[i].in_use) &&
+                file_registry[i].path &&
+                strcmp(file_registry[i].path, path) == 0) {
+                erm_file *file = file_registry[i].file;
+                free(file_registry[i].path);
+                file_registry[i].file = NULL;
+                file_registry[i].path = NULL;
+                atomic_store(&file_registry[i].in_use, 0);
+
+                if (file) {
+                    ermfs_destroy(file);
+                }
+                break;
+            }
+        }
+        return NULL;
+    }
+#endif
     pthread_mutex_lock(&file_registry_mutex);
     for (int i = 0; i < ERMFS_MAX_REGISTRY_FILES; i++) {
-        if (file_registry[i].in_use && 
-            file_registry[i].path && 
+        if (file_registry[i].in_use &&
+            file_registry[i].path &&
             strcmp(file_registry[i].path, path) == 0) {
             erm_file *file = file_registry[i].file;
-            pthread_mutex_lock(&file->mutex);
+            ermfs_lock_file(file);
+#ifdef ERMFS_LOCKLESS
+            atomic_fetch_add(&file->ref_count, 1);
+#else
             file->ref_count++;
-            pthread_mutex_unlock(&file->mutex);
+#endif
+            ermfs_unlock_file(file);
             pthread_mutex_unlock(&file_registry_mutex);
             return file;
         }
@@ -270,6 +338,30 @@ erm_file *ermfs_find_file_by_path(const char *path) {
 static int register_file(erm_file *file, const char *path) {
     init_file_registry();
     
+#ifdef ERMFS_LOCKLESS
+    if (ermfs_is_lockless()) {
+        for (int i = 0; i < ERMFS_MAX_REGISTRY_FILES; i++) {
+            int expected = 0;
+            if (atomic_compare_exchange_strong(&file_registry[i].in_use, &expected, 1)) {
+                file_registry[i].file = file;
+                file_registry[i].path = malloc(strlen(path) + 1);
+                if (!file_registry[i].path) {
+                    atomic_store(&file_registry[i].in_use, 0);
+                    errno = ENOMEM;
+                    return -1;
+                }
+                strcpy(file_registry[i].path, path);
+
+                ermfs_lock_file(file);
+                atomic_fetch_add(&file->ref_count, 1);
+                ermfs_unlock_file(file);
+                return 0;
+            }
+        }
+        errno = ENFILE;
+        return -1;
+    }
+#endif
     pthread_mutex_lock(&file_registry_mutex);
     for (int i = 0; i < ERMFS_MAX_REGISTRY_FILES; i++) {
         if (!file_registry[i].in_use) {
@@ -281,12 +373,20 @@ static int register_file(erm_file *file, const char *path) {
                 return -1;
             }
             strcpy(file_registry[i].path, path);
+#ifdef ERMFS_LOCKLESS
+            atomic_store(&file_registry[i].in_use, 1);
+#else
             file_registry[i].in_use = 1;
+#endif
             
             /* Registry holds a reference to the file */
-            pthread_mutex_lock(&file->mutex);
+            ermfs_lock_file(file);
+#ifdef ERMFS_LOCKLESS
+            atomic_fetch_add(&file->ref_count, 1);
+#else
             file->ref_count++;
-            pthread_mutex_unlock(&file->mutex);
+#endif
+            ermfs_unlock_file(file);
             
             pthread_mutex_unlock(&file_registry_mutex);
             return 0;
@@ -312,7 +412,11 @@ static void unregister_file(const char *path) {
             free(file_registry[i].path);
             file_registry[i].file = NULL;
             file_registry[i].path = NULL;
+#ifdef ERMFS_LOCKLESS
+            atomic_store(&file_registry[i].in_use, 0);
+#else
             file_registry[i].in_use = 0;
+#endif
             
             /* Registry releases its reference to the file */
             if (file) {
@@ -327,21 +431,45 @@ static void unregister_file(const char *path) {
 
 /* Lock and unlock helpers for internal modules */
 void ermfs_lock_file(erm_file *file) {
-    if (file) {
+    if (!file) return;
+#ifdef ERMFS_LOCKLESS
+    if (!ermfs_is_lockless()) {
         pthread_mutex_lock(&file->mutex);
     }
+#else
+    pthread_mutex_lock(&file->mutex);
+#endif
 }
 
 void ermfs_unlock_file(erm_file *file) {
-    if (file) {
+    if (!file) return;
+#ifdef ERMFS_LOCKLESS
+    if (!ermfs_is_lockless()) {
         pthread_mutex_unlock(&file->mutex);
     }
+#else
+    pthread_mutex_unlock(&file->mutex);
+#endif
 }
 
 /* Allocate a new file descriptor */
 static ermfs_fd_t alloc_fd(erm_file *file, int fd_mode) {
     init_fd_table();
     
+#ifdef ERMFS_LOCKLESS
+    if (ermfs_is_lockless()) {
+        for (int i = 0; i < ERMFS_MAX_FILES; i++) {
+            int expected = 0;
+            if (atomic_compare_exchange_strong((atomic_int *)&fd_table[i].in_use, &expected, 1)) {
+                fd_table[i].file = file;
+                fd_table[i].fd_mode = fd_mode;
+                return ERMFS_FD_OFFSET + i;
+            }
+        }
+        errno = EMFILE;
+        return -1;
+    }
+#endif
     pthread_mutex_lock(&fd_table_mutex);
     for (int i = 0; i < ERMFS_MAX_FILES; i++) {
         if (!fd_table[i].in_use) {
@@ -367,6 +495,15 @@ static erm_file *get_file_from_fd(ermfs_fd_t fd) {
         return NULL;
     }
     
+#ifdef ERMFS_LOCKLESS
+    if (ermfs_is_lockless()) {
+        if (!fd_table[idx].in_use) {
+            errno = EBADF;
+            return NULL;
+        }
+        return fd_table[idx].file;
+    }
+#endif
     pthread_mutex_lock(&fd_table_mutex);
     if (!fd_table[idx].in_use) {
         pthread_mutex_unlock(&fd_table_mutex);
@@ -387,6 +524,13 @@ static int get_fd_mode(ermfs_fd_t fd) {
         return -1;
     }
     
+#ifdef ERMFS_LOCKLESS
+    if (ermfs_is_lockless()) {
+        if (!fd_table[idx].in_use)
+            return -1;
+        return fd_table[idx].fd_mode;
+    }
+#endif
     pthread_mutex_lock(&fd_table_mutex);
     if (!fd_table[idx].in_use) {
         pthread_mutex_unlock(&fd_table_mutex);
@@ -407,6 +551,18 @@ static int free_fd(ermfs_fd_t fd) {
         return -1;
     }
     
+#ifdef ERMFS_LOCKLESS
+    if (ermfs_is_lockless()) {
+        if (!fd_table[idx].in_use) {
+            errno = EBADF;
+            return -1;
+        }
+        fd_table[idx].file = NULL;
+        atomic_store((atomic_int *)&fd_table[idx].in_use, 0);
+        fd_table[idx].fd_mode = 0;
+        return 0;
+    }
+#endif
     pthread_mutex_lock(&fd_table_mutex);
     if (!fd_table[idx].in_use) {
         pthread_mutex_unlock(&fd_table_mutex);
@@ -460,9 +616,9 @@ ermfs_fd_t ermfs_open(const char *path, int flags) {
         }
     } else {
         /* Reset position for new file descriptor */
-        pthread_mutex_lock(&file->mutex);
+        ermfs_lock_file(file);
         /* Don't reset position - each FD should have independent position */
-        pthread_mutex_unlock(&file->mutex);
+        ermfs_unlock_file(file);
     }
     
     /* Determine FD mode (can be more restrictive than file mode) */
@@ -511,18 +667,18 @@ ssize_t ermfs_read(ermfs_fd_t fd, void *buf, size_t len) {
         return -1;  /* File not open for reading */
     }
     
-    pthread_mutex_lock(&file->mutex);
+    ermfs_lock_file(file);
     
     /* Ensure data is decompressed before reading */
     if (ensure_decompressed(file) != 0) {
-        pthread_mutex_unlock(&file->mutex);
+        ermfs_unlock_file(file);
         errno = EIO;
         return -1;
     }
     
     /* Check bounds */
     if (file->position >= (off_t)file->size) {
-        pthread_mutex_unlock(&file->mutex);
+        ermfs_unlock_file(file);
         return 0;  /* EOF */
     }
     
@@ -534,7 +690,7 @@ ssize_t ermfs_read(ermfs_fd_t fd, void *buf, size_t len) {
     memcpy(buf, (char *)file->data + file->position, to_read);
     file->position += to_read;
     
-    pthread_mutex_unlock(&file->mutex);
+    ermfs_unlock_file(file);
     return (ssize_t)to_read;
 }
 
@@ -556,11 +712,11 @@ ssize_t ermfs_write_fd(ermfs_fd_t fd, const void *buf, size_t len) {
         return -1;  /* File not open for writing */
     }
     
-    pthread_mutex_lock(&file->mutex);
+    ermfs_lock_file(file);
     
     /* Ensure data is decompressed before writing */
     if (ensure_decompressed(file) != 0) {
-        pthread_mutex_unlock(&file->mutex);
+        ermfs_unlock_file(file);
         errno = EIO;
         return -1;
     }
@@ -576,7 +732,7 @@ ssize_t ermfs_write_fd(ermfs_fd_t fd, const void *buf, size_t len) {
         }
         void *newdata = erm_resize(file->data, file->capacity, newcap);
         if (!newdata) {
-            pthread_mutex_unlock(&file->mutex);
+            ermfs_unlock_file(file);
             errno = ENOMEM;
             return -1;
         }
@@ -593,7 +749,7 @@ ssize_t ermfs_write_fd(ermfs_fd_t fd, const void *buf, size_t len) {
         file->size = file->position;
     }
     
-    pthread_mutex_unlock(&file->mutex);
+    ermfs_unlock_file(file);
     return (ssize_t)len;
 }
 
@@ -604,11 +760,11 @@ off_t ermfs_seek(ermfs_fd_t fd, off_t offset, int whence) {
         return -1;
     }
     
-    pthread_mutex_lock(&file->mutex);
+    ermfs_lock_file(file);
     
     /* Ensure data is decompressed for size calculations */
     if (ensure_decompressed(file) != 0) {
-        pthread_mutex_unlock(&file->mutex);
+        ermfs_unlock_file(file);
         errno = EIO;
         return -1;
     }
@@ -625,21 +781,21 @@ off_t ermfs_seek(ermfs_fd_t fd, off_t offset, int whence) {
             new_pos = (off_t)file->size + offset;
             break;
         default:
-            pthread_mutex_unlock(&file->mutex);
+            ermfs_unlock_file(file);
             errno = EINVAL;
             return -1;  /* Invalid whence */
     }
     
     /* Validate new position (allow seeking past end for writes) */
     if (new_pos < 0) {
-        pthread_mutex_unlock(&file->mutex);
+        ermfs_unlock_file(file);
         errno = EINVAL;
         return -1;
     }
     
     file->position = new_pos;
     off_t result = new_pos;
-    pthread_mutex_unlock(&file->mutex);
+    ermfs_unlock_file(file);
     return result;
 }
 
@@ -650,11 +806,11 @@ int ermfs_stat(ermfs_fd_t fd, struct ermfs_stat *stat) {
         return -1;
     }
     
-    pthread_mutex_lock(&file->mutex);
+    ermfs_lock_file(file);
     stat->size = ermfs_size(file);  /* Use existing function that handles compression */
     stat->compressed = file->compressed;
     stat->mode = file->mode;
-    pthread_mutex_unlock(&file->mutex);
+    ermfs_unlock_file(file);
     
     return 0;
 }
@@ -668,23 +824,23 @@ int ermfs_close_fd(ermfs_fd_t fd) {
     
     /* Get the path before we potentially destroy the file */
     char *path = NULL;
-    pthread_mutex_lock(&file->mutex);
+    ermfs_lock_file(file);
     if (file->path) {
         path = malloc(strlen(file->path) + 1);
         if (path) {
             strcpy(path, file->path);
         }
     }
-    pthread_mutex_unlock(&file->mutex);
+    ermfs_unlock_file(file);
     
     /* Compress the file using existing close logic */
     ermfs_close(file);
     
     /* Check if this is the last reference and if file is compressed */
-    pthread_mutex_lock(&file->mutex);
+    ermfs_lock_file(file);
     int is_last_ref = (file->ref_count <= 1);
     int is_compressed = file->compressed;
-    pthread_mutex_unlock(&file->mutex);
+    ermfs_unlock_file(file);
     
     /* Destroy the file (will decrement ref_count) */
     ermfs_destroy(file);
@@ -725,11 +881,11 @@ int ermfs_truncate(ermfs_fd_t fd, off_t length) {
         return -1;  /* File not open for writing */
     }
     
-    pthread_mutex_lock(&file->mutex);
+    ermfs_lock_file(file);
     
     /* Ensure data is decompressed before truncating */
     if (ensure_decompressed(file) != 0) {
-        pthread_mutex_unlock(&file->mutex);
+        ermfs_unlock_file(file);
         errno = EIO;
         return -1;
     }
@@ -744,7 +900,7 @@ int ermfs_truncate(ermfs_fd_t fd, off_t length) {
         }
         void *newdata = erm_resize(file->data, file->capacity, newcap);
         if (!newdata) {
-            pthread_mutex_unlock(&file->mutex);
+            ermfs_unlock_file(file);
             errno = ENOMEM;
             return -1;
         }
@@ -764,6 +920,6 @@ int ermfs_truncate(ermfs_fd_t fd, off_t length) {
         file->position = (off_t)new_size;
     }
     
-    pthread_mutex_unlock(&file->mutex);
+    ermfs_unlock_file(file);
     return 0;
 }
